@@ -20,13 +20,13 @@ from tkinter import ttk, filedialog, messagebox
 _HAS_SOCKS = False
 _HAS_REQUESTS = False
 try:
-    import socks  # PySocks
+    import socks  # PySocks (opsional, hanya jika pakai proxy)
     _HAS_SOCKS = True
 except Exception:
     pass
 
 try:
-    import requests
+    import requests  # (opsional, hanya jika pakai remote probe)
     _HAS_REQUESTS = True
 except Exception:
     pass
@@ -41,19 +41,12 @@ SMTP_PREFER_IPV4        = os.getenv("SMTP_PREFER_IPV4", "true").lower() == "true
 SMTP_TLS                = os.getenv("SMTP_TLS", "false").lower() == "true"
 SMTP_PRECHECK           = os.getenv("SMTP_PRECHECK", "true").lower() == "true"
 
-# === NEW: Probe strategy & fallbacks ===
+# === Probe strategy & fallbacks ===
 # auto | local | proxy | remote
 PROBE_STRATEGY          = os.getenv("PROBE_STRATEGY", "auto").lower().strip()
-
-# SOCKS/HTTP proxy, contoh:
-# PROXY_URL=socks5h://user:pass@host:1080  (socks5h recommended)
-# PROXY_URL=http://user:pass@host:8080     (HTTP CONNECT)
-PROXY_URL               = os.getenv("PROXY_URL", "").strip()
-
-# Remote probe API (self-hosted): POST {email} or {email, domain}
-# Expect response JSON: {"ok": true/false, "detail": "rcpt:250 ..."}
-REMOTE_PROBE_URL        = os.getenv("REMOTE_PROBE_URL", "").strip()
-REMOTE_API_KEY          = os.getenv("REMOTE_API_KEY", "").strip()  # optional auth header
+PROXY_URL               = os.getenv("PROXY_URL", "").strip()            # e.g. socks5h://user:pass@host:1080
+REMOTE_PROBE_URL        = os.getenv("REMOTE_PROBE_URL", "").strip()     # HTTP API endpoint (self-hosted)
+REMOTE_API_KEY          = os.getenv("REMOTE_API_KEY", "").strip()
 
 # ---------------------- Utils ----------------------
 
@@ -94,4 +87,708 @@ def dns_check(domain: str):
                 dns.resolver.resolve(domain, 'AAAA')
                 return True, False, "mx=False;AAAA=True"
             except Exception as e_ip:
-                return False,
+                return False, False, f"dns_failed:{e_ip}"
+
+def mx_hosts(domain: str):
+    try:
+        answers = dns.resolver.resolve(domain, 'MX')
+        return sorted(answers, key=lambda r: r.preference)
+    except Exception:
+        return []
+
+def has_spf(domain: str) -> bool:
+    try:
+        answers = dns.resolver.resolve(domain, 'TXT')
+        for r in answers:
+            txt = "".join([b.decode(errors='ignore') if isinstance(b, bytes) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
+            if "v=spf1" in txt.lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+def has_dmarc(domain: str) -> bool:
+    try:
+        dmarc_domain = f"_dmarc.{domain}"
+        answers = dns.resolver.resolve(dmarc_domain, 'TXT')
+        for r in answers:
+            txt = "".join([b.decode(errors='ignore') if isinstance(b, bytes) else str(b) for b in r.strings]) if hasattr(r, 'strings') else str(r)
+            if "v=dmarc1" in txt.lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+FREE_MAIL = {
+    "gmail.com","yahoo.com","outlook.com","hotmail.com","live.com","aol.com",
+    "icloud.com","yandex.com","proton.me","protonmail.com","zoho.com","gmx.com","mail.com"
+}
+
+def _getaddrinfos(host: str, port: int):
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if SMTP_PREFER_IPV4:
+        infos.sort(key=lambda x: x[0] != socket.AF_INET)
+    return infos
+
+def can_reach_port25(test_host: str = "gmail-smtp-in.l.google.com", port: int = None) -> bool:
+    p = port if port is not None else SMTP_PORT
+    try:
+        infos = _getaddrinfos(test_host, p)
+        last_exc = None
+        for family, socktype, proto, _, sockaddr in infos:
+            try:
+                s = socket.socket(family, socktype, proto)
+                s.settimeout(min(SMTP_CONNECT_TIMEOUT, 5.0))
+                s.connect(sockaddr)
+                s.close()
+                return True
+            except Exception as e:
+                last_exc = e
+                continue
+        return False
+    except Exception:
+        return False
+
+# ---------------------- Socket helpers ----------------------
+
+def _plain_socket_connect(host: str, port: int, connect_timeout: float) -> socket.socket:
+    infos = _getaddrinfos(host, port)
+    last_exc = None
+    for family, socktype, proto, _, sockaddr in infos:
+        try:
+            s = socket.socket(family, socktype, proto)
+            s.settimeout(connect_timeout)
+            s.connect(sockaddr)
+            return s
+        except Exception as e:
+            last_exc = e
+            continue
+    raise last_exc or OSError("no usable address")
+
+def _proxy_socket_connect(host: str, port: int, connect_timeout: float, proxy_url: str) -> socket.socket:
+    if not _HAS_SOCKS:
+        raise RuntimeError("PySocks not installed (pip install PySocks)")
+    import urllib.parse
+    u = urllib.parse.urlparse(proxy_url)
+    scheme = u.scheme.lower()
+    if scheme in ("socks5", "socks5h"):
+        ptype = socks.SOCKS5
+    elif scheme in ("socks4", "socks4a"):
+        ptype = socks.SOCKS4
+    elif scheme in ("http", "https"):
+        ptype = socks.HTTP
+    else:
+        raise ValueError(f"Unsupported proxy scheme: {scheme}")
+
+    proxy_host = u.hostname
+    proxy_port = u.port or (1080 if "socks" in scheme else 8080)
+    proxy_username = u.username
+    proxy_password = u.password
+    rdns = scheme.endswith("h") or scheme.endswith("a")  # socks5h/socks4a = remote DNS
+
+    s = socks.socksocket()
+    s.set_proxy(ptype, proxy_host, proxy_port, rdns=rdns, username=proxy_username, password=proxy_password)
+    s.settimeout(connect_timeout)
+    s.connect((host, port))
+    return s
+
+# ---------------------- SMTP probe backends ----------------------
+
+def _recv_block(f, sock, read_timeout: float, prefixes=(b'2', b'3')) -> Tuple[str, bool]:
+    lines = []
+    sock.settimeout(read_timeout)
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        lines.append(line)
+        if len(line) >= 4 and line[3:4] != b'-':
+            break
+    text = b''.join(lines).decode(errors='ignore')
+    return text, (text[:1].encode() in prefixes)
+
+def _smtp_session(sock: socket.socket, host: str, recipient: str) -> Tuple[bool, str]:
+    f = sock.makefile('rwb', buffering=0)
+
+    banner, ok = _recv_block(f, sock, SMTP_READ_TIMEOUT, prefixes=(b'2',))
+    if not ok:
+        return False, f"banner:{banner.strip()}"
+
+    def send(cmd: str):
+        f.write(cmd.encode() + b"\r\n")
+
+    # EHLO -> (optional) STARTTLS -> EHLO
+    send(f"EHLO {SMTP_HELO_DOMAIN}")
+    resp, ok = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+    if not ok:
+        send(f"HELO {SMTP_HELO_DOMAIN}")
+        resp, ok = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+
+    if SMTP_TLS and "STARTTLS" in resp.upper():
+        send("STARTTLS")
+        tls_resp, ok_tls = _recv_block(f, sock, SMTP_READ_TIMEOUT, prefixes=(b'2',))
+        if ok_tls:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+            f = sock.makefile('rwb', buffering=0)
+            send(f"EHLO {SMTP_HELO_DOMAIN}")
+            resp, ok = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+
+    send(f"MAIL FROM:<{SMTP_MAIL_FROM}>")
+    resp, ok = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+    if not ok:
+        send("QUIT")
+        _ = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+        return False, f"mailfrom:{resp.strip()}"
+
+    send(f"RCPT TO:<{recipient}>")
+    resp, _ = _recv_block(f, sock, SMTP_READ_TIMEOUT, prefixes=(b'2', b'3'))
+
+    send("QUIT")
+    _ = _recv_block(f, sock, SMTP_READ_TIMEOUT)
+
+    r = resp.strip()
+    if r.startswith("250"):
+        return True, f"rcpt:{r}"
+    elif r.startswith(("450", "451", "452")):
+        return False, f"rcpt_tempfail:{r}"
+    else:
+        return False, f"rcpt:{r}"
+
+def smtp_probe_local(recipient: str, mx_records) -> Tuple[bool, str]:
+    mx_list: List = list(mx_records) if mx_records else []
+    last = "no_mx_reachable"
+    for mx in mx_list:
+        host = str(mx.exchange).rstrip('.') if hasattr(mx, 'exchange') else str(mx).rstrip('.')
+        try:
+            sock = _plain_socket_connect(host, SMTP_PORT, SMTP_CONNECT_TIMEOUT)
+            try:
+                ok, detail = _smtp_session(sock, host, recipient)
+                sock.close()
+                return ok, detail
+            except Exception as e:
+                last = f"io_error:{host}:{e}"
+                try: sock.close()
+                except: pass
+                continue
+        except Exception as e:
+            last = f"conn_error:{host}:{e}"
+            continue
+    return False, last
+
+def smtp_probe_proxy(recipient: str, mx_records) -> Tuple[bool, str]:
+    if not PROXY_URL:
+        return False, "proxy_not_configured"
+    if not _HAS_SOCKS:
+        return False, "pysocks_not_installed"
+    mx_list: List = list(mx_records) if mx_records else []
+    last = "no_mx_reachable"
+    for mx in mx_list:
+        host = str(mx.exchange).rstrip('.') if hasattr(mx, 'exchange') else str(mx).rstrip('.')
+        try:
+            sock = _proxy_socket_connect(host, SMTP_PORT, SMTP_CONNECT_TIMEOUT, PROXY_URL)
+            try:
+                ok, detail = _smtp_session(sock, host, recipient)
+                sock.close()
+                return ok, detail
+            except Exception as e:
+                last = f"proxy_io_error:{host}:{e}"
+                try: sock.close()
+                except: pass
+                continue
+        except Exception as e:
+            last = f"proxy_conn_error:{host}:{e}"
+            continue
+    return False, last
+
+def smtp_probe_remote(recipient: str, domain: str) -> Tuple[bool, str]:
+    if not REMOTE_PROBE_URL:
+        return False, "remote_not_configured"
+    if not _HAS_REQUESTS:
+        return False, "requests_not_installed"
+    try:
+        headers = {}
+        if REMOTE_API_KEY:
+            headers["Authorization"] = f"Bearer {REMOTE_API_KEY}"
+        r = requests.post(REMOTE_PROBE_URL, json={"email": recipient, "domain": domain}, headers=headers,
+                          timeout=SMTP_CONNECT_TIMEOUT + SMTP_READ_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        ok = bool(data.get("ok"))
+        detail = str(data.get("detail", ""))
+        return ok, detail or ("remote_ok" if ok else "remote_fail")
+    except Exception as e:
+        return False, f"remote_error:{e}"
+
+# ---------------------- NEW: Heuristic fallback ----------------------
+
+def _looks_random_local(local: str) -> bool:
+    # sederhana: local-part sangat panjang & alpha-num semua → kemungkinan user acak
+    s = "".join(ch for ch in local if ch.isalnum())
+    return len(local) >= 20 and len(s) / max(1, len(local)) > 0.9
+
+def smtp_probe_heuristic(recipient: str, domain: str) -> Tuple[Optional[bool], str]:
+    """
+    Estimasi deliverability TANPA koneksi port 25 (karena diblokir).
+    Kembalikan (None, "heuristic:score=...,signals=...") — None = bukan hasil RCPT aktual.
+    """
+    try:
+        local = recipient.split("@", 1)[0]
+    except Exception:
+        local = ""
+
+    dom_ok, has_mx, _ = dns_check(domain)
+    spf = has_spf(domain) if dom_ok else False
+    dmarc = has_dmarc(domain) if dom_ok else False
+    free = domain.lower() in FREE_MAIL
+    randomish = _looks_random_local(local)
+
+    # scoring sederhana (0..1)
+    score = 0.5
+    signals = []
+
+    if dom_ok:
+        signals.append("dns")
+        score += 0.1
+    if has_mx:
+        signals.append("mx")
+        score += 0.2
+    else:
+        signals.append("no-mx")
+
+    if spf:
+        signals.append("spf")
+        score += 0.1
+    if dmarc:
+        signals.append("dmarc")
+        score += 0.1
+    if free:
+        signals.append("free-mail")
+        score -= 0.1  # bukan “buruk”, cuma sulit diverifikasi via callout
+    if randomish:
+        signals.append("random-local")
+        score -= 0.2
+
+    # clamp
+    score = max(0.0, min(1.0, score))
+    detail = f"heuristic:score={score:.2f},signals={','.join(signals) or '-'}"
+
+    # Kita sengaja mengembalikan None agar pipeline tahu ini ESTIMASI, bukan RCPT beneran.
+    return None, detail
+
+# ---------------------- Router ----------------------
+
+def smtp_probe_best(recipient: str, mx_records, domain: str, port25_available: bool) -> Tuple[Optional[bool], str]:
+    strat = PROBE_STRATEGY
+    if strat == "auto":
+        if port25_available:
+            ok, d = smtp_probe_local(recipient, mx_records)
+            return ok, d
+        if PROXY_URL:
+            ok, d = smtp_probe_proxy(recipient, mx_records)
+            return ok, d
+        if REMOTE_PROBE_URL:
+            ok, d = smtp_probe_remote(recipient, domain)
+            return ok, d
+        # NEW: fallback heuristik (tidak disable)
+        return smtp_probe_heuristic(recipient, domain)
+
+    elif strat == "local":
+        if not port25_available:
+            # tetap pakai heuristik, tidak disable
+            return smtp_probe_heuristic(recipient, domain)
+        ok, d = smtp_probe_local(recipient, mx_records)
+        return ok, d
+
+    elif strat == "proxy":
+        ok, d = smtp_probe_proxy(recipient, mx_records)
+        # jika proxy gagal total → heuristik
+        if "proxy_" in (d or ""):
+            est_ok, est_d = smtp_probe_heuristic(recipient, domain)
+            return est_ok, est_d
+        return ok, d
+
+    elif strat == "remote":
+        ok, d = smtp_probe_remote(recipient, domain)
+        # jika remote gagal total → heuristik
+        if "remote_" in (d or ""):
+            est_ok, est_d = smtp_probe_heuristic(recipient, domain)
+            return est_ok, est_d
+        return ok, d
+
+    else:
+        # strategi tak dikenal → heuristik
+        return smtp_probe_heuristic(recipient, domain)
+
+# ---------------------- Verifier core ----------------------
+
+def verify_one(email: str, company: Optional[str], company_domain: Optional[str], do_smtp: bool, port25_available: bool):
+    reason = []
+    steps = []
+
+    # Syntax
+    try:
+        v = validate_email(email, check_deliverability=False)
+        norm_email = v.email
+        local = v.local_part
+        domain = v.domain
+        steps.append("syntax:OK")
+    except EmailNotValidError as e:
+        steps.append(f"syntax:ERR:{e}")
+        return {
+            "verif_syntax_ok": False, "verif_domain_ok": False, "verif_mx_found": False,
+            "verif_smtp_deliverable": None, "verif_company_ok": None,
+            "verif_registered_domain": None, "verif_reason": f"syntax:{e}",
+            "email_norm": email, "email_local": None, "email_domain": None,
+            "steps": " | ".join(steps)
+        }
+
+    # DNS
+    dom_ok, has_mx, reason_dns = dns_check(domain)
+    reason.append(reason_dns)
+    steps.append(f"dns:{'OK' if dom_ok else 'ERR'};{reason_dns}")
+
+    # SMTP (opsional + strategy)
+    smtp_ok: Optional[bool] = None
+    smtp_detail = ""
+    if do_smtp and has_mx:
+        mhosts = mx_hosts(domain)
+        smtp_ok, smtp_detail = smtp_probe_best(norm_email, mhosts, domain, port25_available)
+
+        if smtp_detail.startswith("heuristic:"):
+            steps.append(f"smtp:EST;{smtp_detail}")
+        else:
+            if smtp_ok is None:
+                steps.append(f"smtp:N/A;{smtp_detail}")  # kejadian langka
+            else:
+                tag = "OK" if smtp_ok else "NO"
+                steps.append(f"smtp:{tag};{smtp_detail}")
+
+        if smtp_detail:
+            reason.append(smtp_detail)
+    else:
+        steps.append("smtp:SKIP")  # no MX or checkbox off
+
+    # Company
+    comp_ok, comp_reason = company_match(domain, company, company_domain)
+    reason.append(comp_reason)
+    if comp_ok is True:
+        steps.append("company:OK")
+    elif comp_ok is False:
+        steps.append("company:NO")
+    else:
+        steps.append("company:N/A")
+
+    return {
+        "verif_syntax_ok": True, "verif_domain_ok": dom_ok, "verif_mx_found": has_mx,
+        "verif_smtp_deliverable": smtp_ok, "verif_company_ok": comp_ok,
+        "verif_registered_domain": normalize_registered_domain(domain),
+        "verif_reason": ";".join([r for r in reason if r]),
+        "email_norm": norm_email, "email_local": local, "email_domain": domain,
+        "steps": " | ".join(steps)
+    }
+
+# ---------------------- GUI ----------------------
+
+class VerifierGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Email Verifier - CSV Cleaner (Live Progress)")
+        self.geometry("980x680")
+        self.minsize(940, 640)
+
+        self.input_path = tk.StringVar()
+        self.output_prefix = tk.StringVar(value="verified")
+        self.email_col = tk.StringVar(value="email")
+        self.company_col = tk.StringVar(value="company")
+        self.company_domain_col = tk.StringVar(value="company_domain")
+        self.use_smtp = tk.BooleanVar(value=False)
+        self.output_format = tk.StringVar(value="csv")
+        self.verbose = tk.BooleanVar(value=True)
+        self.live_table = tk.BooleanVar(value=True)
+
+        self._build_widgets()
+        self.queue = queue.Queue()
+        self.worker: Optional[threading.Thread] = None
+
+    def _build_widgets(self):
+        pad = {"padx": 10, "pady": 6}
+        frm = ttk.Frame(self); frm.pack(fill="x", **pad)
+
+        ttk.Label(frm, text="Input CSV").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.input_path, width=60).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Button(frm, text="Browse...", command=self.browse_file).grid(row=0, column=2)
+
+        ttk.Label(frm, text="Email Column").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.email_col, width=20).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frm, text="Company Column").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.company_col, width=20).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(frm, text="Company Domain Column").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.company_domain_col, width=20).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(frm, text="Output Prefix").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.output_prefix, width=20).grid(row=4, column=1, sticky="w")
+
+        opts = ttk.Frame(frm); opts.grid(row=5, column=1, sticky="w")
+        ttk.Checkbutton(opts, text="SMTP probe (lebih akurat, bisa lambat)", variable=self.use_smtp).pack(anchor="w")
+
+        row2 = ttk.Frame(frm); row2.grid(row=6, column=1, sticky="w")
+        ttk.Label(frm, text="Output Format").grid(row=6, column=0, sticky="w")
+        ttk.Combobox(row2, textvariable=self.output_format, values=["csv", "excel"], width=10, state="readonly").pack(side="left")
+        ttk.Checkbutton(row2, text="Verbose log", variable=self.verbose).pack(side="left", padx=10)
+        ttk.Checkbutton(row2, text="Live table", variable=self.live_table).pack(side="left", padx=10)
+
+        btnfrm = ttk.Frame(self); btnfrm.pack(fill="x", **pad)
+        self.run_btn = ttk.Button(btnfrm, text="Run Verification", command=self.run_verification); self.run_btn.pack(side="left")
+        self.stop_btn = ttk.Button(btnfrm, text="Stop", command=self.stop_verification, state="disabled"); self.stop_btn.pack(side="left", padx=8)
+
+        pfrm = ttk.Frame(self); pfrm.pack(fill="x", **pad)
+        self.current_label = ttk.Label(pfrm, text="Current: -", anchor="w"); self.current_label.pack(fill="x")
+        self.prog = ttk.Progressbar(pfrm, mode="determinate"); self.prog.pack(fill="x")
+
+        tfrm = ttk.LabelFrame(self, text="Live Results"); tfrm.pack(fill="both", expand=True, padx=10, pady=(0,6))
+        cols = ("email", "syntax", "domain", "mx", "smtp", "company", "deliverable", "reason")
+        self.tree = ttk.Treeview(tfrm, columns=cols, show="headings", height=8)
+        for c in cols: self.tree.heading(c, text=c.capitalize())
+        self.tree.column("email", width=240)
+        self.tree.column("syntax", width=70, anchor="center")
+        self.tree.column("domain", width=70, anchor="center")
+        self.tree.column("mx", width=60, anchor="center")
+        self.tree.column("smtp", width=80, anchor="center")   # lebarin dikit buat 'EST'
+        self.tree.column("company", width=80, anchor="center")
+        self.tree.column("deliverable", width=90, anchor="center")
+        self.tree.column("reason", width=380)
+        self.tree.pack(fill="both", expand=True)
+
+        lfrm = ttk.LabelFrame(self, text="Verbose Log"); lfrm.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        self.log = tk.Text(lfrm, height=8); self.log.pack(fill="both", expand=True)
+
+        self.status = ttk.Label(self, text="Ready", anchor="w"); self.status.pack(fill="x")
+
+        for i in range(3):
+            frm.grid_columnconfigure(i, weight=(1 if i == 1 else 0))
+
+        self.after(100, self._poll_queue)
+
+    def browse_file(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if path: self.input_path.set(path)
+
+    def log_write(self, text: str):
+        if not self.verbose.get(): return
+        self.log.insert("end", text + "\n"); self.log.see("end")
+
+    def set_status(self, text: str): self.status.config(text=text)
+    def set_current(self, text: str): self.current_label.config(text=f"Current: {text}")
+
+    def run_verification(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Sedang berjalan", "Proses verifikasi masih berjalan."); return
+        if not self.input_path.get():
+            messagebox.showerror("Error", "Pilih file CSV input."); return
+
+        self.run_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.log.delete("1.0", "end")
+        for i in self.tree.get_children(): self.tree.delete(i)
+        self.set_status("Memulai..."); self.set_current("-")
+
+        args = {
+            "input": self.input_path.get(),
+            "output_prefix": self.output_prefix.get() or "verified",
+            "email_col": self.email_col.get() or "email",
+            "company_col": self.company_col.get() or "company",
+            "company_domain_col": self.company_domain_col.get() or "company_domain",
+            "smtp_check": self.use_smtp.get(),
+            "output_format": self.output_format.get(),
+            "live_table": self.live_table.get()
+        }
+
+        self.worker = threading.Thread(target=self._worker_run, args=(args,), daemon=True)
+        self._stop_flag = False
+        self.worker.start()
+
+    def stop_verification(self):
+        self._stop_flag = True
+        self.set_status("Meminta berhenti...")
+
+    def _worker_run(self, args):
+        try:
+            df = pd.read_csv(args["input"])
+        except Exception as e:
+            self.queue.put(("error", f"Gagal baca CSV: {e}")); return
+
+        if args["email_col"] not in df.columns:
+            self.queue.put(("error", f"Kolom email '{args['email_col']}' tidak ditemukan. Kolom: {list(df.columns)}")); return
+
+        # Port25 availability (sekali di awal)
+        port25_available = True
+        if SMTP_PRECHECK:
+            port25_available = can_reach_port25()
+            if not port25_available:
+                self.queue.put(("log", f"WARNING: Outbound ke port 25 tampaknya diblokir/timeout. "
+                                        f"Strategy={PROBE_STRATEGY}. "
+                                        f"{'Proxy OK' if PROXY_URL else 'No proxy'}. "
+                                        f"{'Remote OK' if REMOTE_PROBE_URL else 'No remote'}. "
+                                        f'Heuristic fallback aktif.'))
+
+        total = len(df)
+        self.queue.put(("start", total))
+
+        results = []
+        for idx, row in df.iterrows():
+            if getattr(self, "_stop_flag", False):
+                self.queue.put(("log", f"Dihentikan di baris {idx+1}/{total}")); break
+
+            raw_email = row[args["email_col"]]
+            email = str(raw_email).strip() if pd.notna(raw_email) else ""
+            company = str(row[args["company_col"]]).strip() if (args["company_col"] in df.columns and pd.notna(row[args["company_col"]])) else None
+            company_domain = str(row[args["company_domain_col"]]).strip() if (args["company_domain_col"] in df.columns and pd.notna(row[args["company_domain_col"]])) else None
+
+            self.queue.put(("current", email if email else "-"))
+
+            if not email:
+                self.queue.put(("progress", idx+1)); continue
+
+            res = verify_one(email, company, company_domain, args["smtp_check"], port25_available)
+
+            # Ringkas deliverable (tanpa memaksa dari heuristik)
+            if res["verif_smtp_deliverable"] is True:
+                deliverable = True
+            elif res["verif_smtp_deliverable"] is False:
+                deliverable = False
+            else:
+                deliverable = bool(res["verif_syntax_ok"] and res["verif_domain_ok"] and res["verif_mx_found"])
+
+            c = res["verif_company_ok"]
+            company_pass = (c is None) or (c is True)
+
+            out = {**row.to_dict(),
+                   "verif_syntax_ok": res["verif_syntax_ok"],
+                   "verif_domain_ok": res["verif_domain_ok"],
+                   "verif_mx_found": res["verif_mx_found"],
+                   "verif_smtp_deliverable": res["verif_smtp_deliverable"],
+                   "verif_company_ok": res["verif_company_ok"],
+                   "verif_registered_domain": res["verif_registered_domain"],
+                   "verif_reason": res["verif_reason"],
+                   "verif_deliverable": deliverable,
+                   "verif_company_pass": company_pass
+                   }
+            results.append(out)
+
+            # Kolom SMTP di tabel: OK/NO/N/A → tambah EST jika heuristik
+            smtp_cell = "N/A"
+            reason = res["verif_reason"]
+            if "heuristic:" in reason:
+                smtp_cell = "EST"
+            else:
+                if res["verif_smtp_deliverable"] is True:
+                    smtp_cell = "OK"
+                elif res["verif_smtp_deliverable"] is False:
+                    smtp_cell = "NO"
+
+            self.queue.put(("row", {
+                "email": email,
+                "syntax": "OK" if res["verif_syntax_ok"] else "NO",
+                "domain": "OK" if res["verif_domain_ok"] else "NO",
+                "mx": "YES" if res["verif_mx_found"] else "NO",
+                "smtp": smtp_cell,
+                "company": "OK" if c is True else ("NO" if c is False else "N/A"),
+                "deliverable": "YES" if deliverable else "NO",
+                "reason": res["verif_reason"],
+                "steps": res.get("steps", "")
+            }))
+
+            self.queue.put(("progress", idx+1))
+
+        out_df = pd.DataFrame(results)
+
+        if len(out_df) > 0:
+            base = os.path.dirname(args["input"]) or "."
+            fmt = (args["output_format"] or "csv").lower().strip()
+            if fmt not in ("csv", "excel"): fmt = "csv"
+
+            clean_df = out_df[(out_df["verif_deliverable"]) & (out_df["verif_company_pass"])]
+
+            if fmt == "csv":
+                full_path = os.path.join(base, f"{args['output_prefix']}_full.csv")
+                clean_path = os.path.join(base, f"{args['output_prefix']}_clean.csv")
+                out_df.to_csv(full_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+                clean_df.to_csv(clean_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+            else:
+                full_path = os.path.join(base, f"{args['output_prefix']}_full.xlsx")
+                clean_path = os.path.join(base, f"{args['output_prefix']}_clean.xlsx")
+                try:
+                    out_df.to_excel(full_path, index=False, engine="openpyxl")
+                    clean_df.to_excel(clean_path, index=False, engine="openpyxl")
+                except Exception as e:
+                    self.queue.put(("log", f"OpenPyXL error: {e}. Fallback ke CSV."))
+                    full_path = os.path.join(base, f"{args['output_prefix']}_full.csv")
+                    clean_path = os.path.join(base, f"{args['output_prefix']}_clean.csv")
+                    out_df.to_csv(full_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+                    clean_df.to_csv(clean_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+
+            self.queue.put(("done", (full_path, clean_path, len(clean_df), len(out_df))))
+        else:
+            self.queue.put(("done", (None, None, 0, 0)))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                self._handle_msg(msg)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_queue)
+
+    def _handle_msg(self, msg):
+        kind, payload = msg
+        if kind == "start":
+            total = payload
+            self.prog.configure(maximum=total, value=0)
+            self.set_status(f"Memproses {total} baris...")
+        elif kind == "progress":
+            self.prog['value'] = payload
+        elif kind == "log":
+            self.log_write(str(payload))
+        elif kind == "current":
+            self.set_current(str(payload))
+        elif kind == "row":
+            if self.live_table.get():
+                data = payload
+                self.tree.insert("", "end", values=(
+                    data["email"], data["syntax"], data["domain"], data["mx"],
+                    data["smtp"], data["company"], data["deliverable"], data["reason"]
+                ))
+            steps = payload.get("steps", "")
+            if steps:
+                self.log_write(f"[{payload['email']}] {steps}")
+        elif kind == "error":
+            self.run_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.set_status("Error")
+            messagebox.showerror("Error", str(payload))
+        elif kind == "done":
+            full_path, clean_path, n_clean, n_all = payload
+            self.run_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.set_current("-")
+            if full_path and clean_path:
+                self.set_status("Selesai")
+                self.log_write(f"Selesai. Full: {full_path}")
+                self.log_write(f"Selesai. Clean: {clean_path}")
+                self.log_write(f"Clean rows: {n_clean}/{n_all}")
+                messagebox.showinfo("Selesai", f"Berhasil!\nFull: {full_path}\nClean: {clean_path}\nClean rows: {n_clean}/{n_all}")
+            else:
+                self.set_status("Tidak ada data tersimpan")
+                messagebox.showwarning("Kosong", "Tidak ada baris yang diverifikasi.")
+
+def main():
+    app = VerifierGUI()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
