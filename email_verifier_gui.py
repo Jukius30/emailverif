@@ -6,6 +6,7 @@ import queue
 import threading
 import socket
 import ssl
+import re
 from typing import Optional, Tuple, List
 
 import pandas as pd
@@ -68,7 +69,7 @@ def company_match(email_domain: str, company: Optional[str], company_domain: Opt
     if company:
         ext = tldextract.extract(email_domain)
         sld = ext.domain.lower() if ext.domain else ""
-        tokens = [t for t in ''.join(ch if ch.isalnum() else ' ' for ch in company.lower()).split() if len(t) >= 3]
+        tokens = [t for t in ''.join(ch if ch.isalnum() else ' ' for ch in (company or "").lower()).split() if len(t) >= 3]
         ok = any(t in sld for t in tokens) if tokens and sld else None
         return ok, f"company_fuzzy:{tokens} in {sld}:{ok}"
     return None, "company_not_provided"
@@ -323,15 +324,10 @@ def smtp_probe_remote(recipient: str, domain: str) -> Tuple[bool, str]:
 # ---------------------- NEW: Heuristic fallback ----------------------
 
 def _looks_random_local(local: str) -> bool:
-    # sederhana: local-part sangat panjang & alpha-num semua → kemungkinan user acak
     s = "".join(ch for ch in local if ch.isalnum())
     return len(local) >= 20 and len(s) / max(1, len(local)) > 0.9
 
 def smtp_probe_heuristic(recipient: str, domain: str) -> Tuple[Optional[bool], str]:
-    """
-    Estimasi deliverability TANPA koneksi port 25 (karena diblokir).
-    Kembalikan (None, "heuristic:score=...,signals=...") — None = bukan hasil RCPT aktual.
-    """
     try:
         local = recipient.split("@", 1)[0]
     except Exception:
@@ -343,37 +339,26 @@ def smtp_probe_heuristic(recipient: str, domain: str) -> Tuple[Optional[bool], s
     free = domain.lower() in FREE_MAIL
     randomish = _looks_random_local(local)
 
-    # scoring sederhana (0..1)
     score = 0.5
     signals = []
 
     if dom_ok:
-        signals.append("dns")
-        score += 0.1
+        signals.append("dns"); score += 0.1
     if has_mx:
-        signals.append("mx")
-        score += 0.2
+        signals.append("mx"); score += 0.2
     else:
         signals.append("no-mx")
-
     if spf:
-        signals.append("spf")
-        score += 0.1
+        signals.append("spf"); score += 0.1
     if dmarc:
-        signals.append("dmarc")
-        score += 0.1
+        signals.append("dmarc"); score += 0.1
     if free:
-        signals.append("free-mail")
-        score -= 0.1  # bukan “buruk”, cuma sulit diverifikasi via callout
+        signals.append("free-mail"); score -= 0.1
     if randomish:
-        signals.append("random-local")
-        score -= 0.2
+        signals.append("random-local"); score -= 0.2
 
-    # clamp
     score = max(0.0, min(1.0, score))
     detail = f"heuristic:score={score:.2f},signals={','.join(signals) or '-'}"
-
-    # Kita sengaja mengembalikan None agar pipeline tahu ini ESTIMASI, bukan RCPT beneran.
     return None, detail
 
 # ---------------------- Router ----------------------
@@ -382,43 +367,77 @@ def smtp_probe_best(recipient: str, mx_records, domain: str, port25_available: b
     strat = PROBE_STRATEGY
     if strat == "auto":
         if port25_available:
-            ok, d = smtp_probe_local(recipient, mx_records)
-            return ok, d
+            return smtp_probe_local(recipient, mx_records)
         if PROXY_URL:
-            ok, d = smtp_probe_proxy(recipient, mx_records)
-            return ok, d
+            return smtp_probe_proxy(recipient, mx_records)
         if REMOTE_PROBE_URL:
-            ok, d = smtp_probe_remote(recipient, domain)
-            return ok, d
-        # NEW: fallback heuristik (tidak disable)
+            return smtp_probe_remote(recipient, domain)
         return smtp_probe_heuristic(recipient, domain)
-
     elif strat == "local":
         if not port25_available:
-            # tetap pakai heuristik, tidak disable
             return smtp_probe_heuristic(recipient, domain)
-        ok, d = smtp_probe_local(recipient, mx_records)
-        return ok, d
-
+        return smtp_probe_local(recipient, mx_records)
     elif strat == "proxy":
         ok, d = smtp_probe_proxy(recipient, mx_records)
-        # jika proxy gagal total → heuristik
         if "proxy_" in (d or ""):
-            est_ok, est_d = smtp_probe_heuristic(recipient, domain)
-            return est_ok, est_d
+            return smtp_probe_heuristic(recipient, domain)
         return ok, d
-
     elif strat == "remote":
         ok, d = smtp_probe_remote(recipient, domain)
-        # jika remote gagal total → heuristik
         if "remote_" in (d or ""):
-            est_ok, est_d = smtp_probe_heuristic(recipient, domain)
-            return est_ok, est_d
+            return smtp_probe_heuristic(recipient, domain)
         return ok, d
-
     else:
-        # strategi tak dikenal → heuristik
         return smtp_probe_heuristic(recipient, domain)
+
+# ---------------------- Heuristics for column detection ----------------------
+
+EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+
+def resolve_column_case_insensitive(df: pd.DataFrame, hint: Optional[str]) -> Optional[str]:
+    if not hint:
+        return None
+    if hint in df.columns:
+        return hint
+    hint_low = hint.lower()
+    for c in df.columns:
+        if isinstance(c, str) and c.lower() == hint_low:
+            return c
+    return None
+
+def autodetect_columns(df: pd.DataFrame, email_hint: str, company_hint: str) -> Tuple[Optional[str], Optional[str]]:
+    email_col = resolve_column_case_insensitive(df, email_hint)
+    company_col = resolve_column_case_insensitive(df, company_hint)
+
+    if email_col is None:
+        candidates = []
+        for c in df.columns:
+            try:
+                cnt = df[c].astype(str).str.fullmatch(EMAIL_REGEX).sum()
+            except Exception:
+                cnt = 0
+            candidates.append((cnt, c))
+        candidates.sort(reverse=True)
+        if candidates and candidates[0][0] > 0:
+            email_col = candidates[0][1]
+
+    if company_col is None:
+        best = None
+        for c in df.columns:
+            if c == email_col:
+                continue
+            s = df[c].astype(str)
+            try:
+                if s.str.fullmatch(EMAIL_REGEX).mean() > 0.3:
+                    continue
+            except Exception:
+                pass
+            avg_len = s.str.len().mean()
+            best = (avg_len, c) if (best is None or avg_len > best[0]) else best
+        if best:
+            company_col = best[1]
+
+    return email_col, company_col
 
 # ---------------------- Verifier core ----------------------
 
@@ -426,9 +445,9 @@ def verify_one(email: str, company: Optional[str], company_domain: Optional[str]
     reason = []
     steps = []
 
-    # Syntax
+    # Syntax (case-insensitive)
     try:
-        v = validate_email(email, check_deliverability=False)
+        v = validate_email(email.casefold(), check_deliverability=False)
         norm_email = v.email
         local = v.local_part
         domain = v.domain
@@ -443,34 +462,29 @@ def verify_one(email: str, company: Optional[str], company_domain: Optional[str]
             "steps": " | ".join(steps)
         }
 
-    # DNS
     dom_ok, has_mx, reason_dns = dns_check(domain)
     reason.append(reason_dns)
     steps.append(f"dns:{'OK' if dom_ok else 'ERR'};{reason_dns}")
 
-    # SMTP (opsional + strategy)
     smtp_ok: Optional[bool] = None
     smtp_detail = ""
     if do_smtp and has_mx:
         mhosts = mx_hosts(domain)
         smtp_ok, smtp_detail = smtp_probe_best(norm_email, mhosts, domain, port25_available)
-
         if smtp_detail.startswith("heuristic:"):
             steps.append(f"smtp:EST;{smtp_detail}")
         else:
             if smtp_ok is None:
-                steps.append(f"smtp:N/A;{smtp_detail}")  # kejadian langka
+                steps.append(f"smtp:N/A;{smtp_detail}")
             else:
                 tag = "OK" if smtp_ok else "NO"
                 steps.append(f"smtp:{tag};{smtp_detail}")
-
         if smtp_detail:
             reason.append(smtp_detail)
     else:
-        steps.append("smtp:SKIP")  # no MX or checkbox off
+        steps.append("smtp:SKIP")
 
-    # Company
-    comp_ok, comp_reason = company_match(domain, company, company_domain)
+    comp_ok, comp_reason = company_match(domain, (company or "").casefold() if company else None, company_domain)
     reason.append(comp_reason)
     if comp_ok is True:
         steps.append("company:OK")
@@ -494,11 +508,13 @@ class VerifierGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Email Verifier - CSV Cleaner (Live Progress)")
-        self.geometry("980x680")
-        self.minsize(940, 640)
+        self.geometry("1040x740")
+        self.minsize(980, 700)
 
         self.input_path = tk.StringVar()
+        self.input_folder_mode = tk.BooleanVar(value=False)  # NEW: folder mode
         self.output_prefix = tk.StringVar(value="verified")
+        self.output_name = tk.StringVar(value="")  # custom filename (optional, no extension)
         self.email_col = tk.StringVar(value="email")
         self.company_col = tk.StringVar(value="company")
         self.company_domain_col = tk.StringVar(value="company_domain")
@@ -511,31 +527,46 @@ class VerifierGUI(tk.Tk):
         self.queue = queue.Queue()
         self.worker: Optional[threading.Thread] = None
 
+    # -------- UI helpers ----------
+    def _suggest_columns(self, headers: List[str]):
+        email_guess = next((h for h in headers if 'email' in h.lower()), None)
+        if email_guess:
+            self.email_col.set(email_guess)
+        company_guess = next((h for h in headers if any(k in h.lower() for k in ['company','perusahaan','org','organization'])), None)
+        if company_guess:
+            self.company_col.set(company_guess)
+
     def _build_widgets(self):
         pad = {"padx": 10, "pady": 6}
         frm = ttk.Frame(self); frm.pack(fill="x", **pad)
 
-        ttk.Label(frm, text="Input CSV").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="Input CSV/Folder").grid(row=0, column=0, sticky="w")
         ttk.Entry(frm, textvariable=self.input_path, width=60).grid(row=0, column=1, sticky="we", padx=6)
         ttk.Button(frm, text="Browse...", command=self.browse_file).grid(row=0, column=2)
+        ttk.Checkbutton(frm, text="Proses seluruh folder (CSV/XLSX)", variable=self.input_folder_mode).grid(row=0, column=3, padx=5)
 
-        ttk.Label(frm, text="Email Column").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.email_col, width=20).grid(row=1, column=1, sticky="w")
+        ttk.Label(frm, text="Output Filename (tanpa ekstensi)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.output_name, width=30).grid(row=1, column=1, sticky="w")
 
-        ttk.Label(frm, text="Company Column").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.company_col, width=20).grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, text="Email Column").grid(row=2, column=0, sticky="w")
+        self.email_combo = ttk.Combobox(frm, textvariable=self.email_col, width=28, state="readonly")
+        self.email_combo.grid(row=2, column=1, sticky="w")
 
-        ttk.Label(frm, text="Company Domain Column").grid(row=3, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.company_domain_col, width=20).grid(row=3, column=1, sticky="w")
+        ttk.Label(frm, text="Company Column").grid(row=3, column=0, sticky="w")
+        self.company_combo = ttk.Combobox(frm, textvariable=self.company_col, width=28, state="readonly")
+        self.company_combo.grid(row=3, column=1, sticky="w")
 
-        ttk.Label(frm, text="Output Prefix").grid(row=4, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.output_prefix, width=20).grid(row=4, column=1, sticky="w")
+        ttk.Label(frm, text="Company Domain Column").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.company_domain_col, width=28).grid(row=4, column=1, sticky="w")
 
-        opts = ttk.Frame(frm); opts.grid(row=5, column=1, sticky="w")
+        ttk.Label(frm, text="Output Prefix (default)").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.output_prefix, width=20).grid(row=5, column=1, sticky="w")
+
+        opts = ttk.Frame(frm); opts.grid(row=6, column=1, sticky="w")
         ttk.Checkbutton(opts, text="SMTP probe (lebih akurat, bisa lambat)", variable=self.use_smtp).pack(anchor="w")
 
-        row2 = ttk.Frame(frm); row2.grid(row=6, column=1, sticky="w")
-        ttk.Label(frm, text="Output Format").grid(row=6, column=0, sticky="w")
+        row2 = ttk.Frame(frm); row2.grid(row=7, column=1, sticky="w")
+        ttk.Label(frm, text="Output Format").grid(row=7, column=0, sticky="w")
         ttk.Combobox(row2, textvariable=self.output_format, values=["csv", "excel"], width=10, state="readonly").pack(side="left")
         ttk.Checkbutton(row2, text="Verbose log", variable=self.verbose).pack(side="left", padx=10)
         ttk.Checkbutton(row2, text="Live table", variable=self.live_table).pack(side="left", padx=10)
@@ -556,7 +587,7 @@ class VerifierGUI(tk.Tk):
         self.tree.column("syntax", width=70, anchor="center")
         self.tree.column("domain", width=70, anchor="center")
         self.tree.column("mx", width=60, anchor="center")
-        self.tree.column("smtp", width=80, anchor="center")   # lebarin dikit buat 'EST'
+        self.tree.column("smtp", width=80, anchor="center")
         self.tree.column("company", width=80, anchor="center")
         self.tree.column("deliverable", width=90, anchor="center")
         self.tree.column("reason", width=380)
@@ -567,14 +598,65 @@ class VerifierGUI(tk.Tk):
 
         self.status = ttk.Label(self, text="Ready", anchor="w"); self.status.pack(fill="x")
 
-        for i in range(3):
+        for i in range(4):
             frm.grid_columnconfigure(i, weight=(1 if i == 1 else 0))
 
         self.after(100, self._poll_queue)
 
     def browse_file(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if path: self.input_path.set(path)
+        # Folder mode: pilih folder
+        if self.input_folder_mode.get():
+            path = filedialog.askdirectory()
+            if not path:
+                return
+            self.input_path.set(path)
+            self.log_write(f"[INFO] Folder mode aktif → {path}")
+            return
+
+        # File tunggal
+        path = filedialog.askopenfilename(filetypes=[("CSV/Excel files", "*.csv;*.xlsx"), ("All files", "*.*")])
+        if not path:
+            return
+        self.input_path.set(path)
+
+        # --- Deteksi header/delimiter untuk prefill combo kolom ---
+        headers = []
+        try:
+            if path.lower().endswith(".xlsx"):
+                df_temp = pd.read_excel(path, nrows=1)
+                headers = list(df_temp.columns)
+                self.log_write(f"[INFO] Detected Excel headers: {headers}")
+            else:
+                with open(path, "rb") as fb:
+                    sample = fb.read(4096)
+                for enc in ("utf-8", "cp1252", "latin-1"):
+                    try:
+                        text = sample.decode(enc, errors="strict")
+                        break
+                    except Exception:
+                        text = None
+                if text is None:
+                    text = sample.decode("utf-8", errors="ignore")
+
+                try:
+                    dialect = csv.Sniffer().sniff(text, delimiters=[",", ";", "\t", "|"])
+                    delim = dialect.delimiter
+                except Exception:
+                    delim = ","
+
+                with open(path, "r", newline="", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.reader(f, delimiter=delim)
+                    headers = next(reader, [])
+                headers = [h.strip() for h in headers]
+                self.log_write(f"[INFO] Detected delimiter: {repr(delim)}; headers: {headers}")
+        except Exception as e:
+            headers = []
+            self.log_write(f"[WARN] Gagal deteksi header: {e}")
+
+        if headers:
+            self.email_combo['values'] = headers
+            self.company_combo['values'] = headers
+            self._suggest_columns(headers)
 
     def log_write(self, text: str):
         if not self.verbose.get(): return
@@ -587,7 +669,18 @@ class VerifierGUI(tk.Tk):
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Sedang berjalan", "Proses verifikasi masih berjalan."); return
         if not self.input_path.get():
-            messagebox.showerror("Error", "Pilih file CSV input."); return
+            messagebox.showerror("Error", "Pilih file atau folder input."); return
+
+        input_path = self.input_path.get()
+        if os.path.isdir(input_path):
+            files = [os.path.join(input_path, f) for f in os.listdir(input_path)
+                     if f.lower().endswith((".csv", ".xlsx"))]
+            if not files:
+                messagebox.showwarning("Kosong", "Tidak ada file CSV/XLSX di folder itu.")
+                return
+            self.log_write(f"[INFO] Akan memproses {len(files)} file dalam folder: {input_path}")
+        else:
+            files = [input_path]
 
         self.run_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -596,17 +689,17 @@ class VerifierGUI(tk.Tk):
         self.set_status("Memulai..."); self.set_current("-")
 
         args = {
-            "input": self.input_path.get(),
+            "files": files,
             "output_prefix": self.output_prefix.get() or "verified",
-            "email_col": self.email_col.get() or "email",
-            "company_col": self.company_col.get() or "company",
-            "company_domain_col": self.company_domain_col.get() or "company_domain",
+            "email_col": self.email_col.get().strip() or "email",
+            "company_col": self.company_col.get().strip() or "company",
+            "company_domain_col": self.company_domain_col.get().strip() or "company_domain",
             "smtp_check": self.use_smtp.get(),
             "output_format": self.output_format.get(),
             "live_table": self.live_table.get()
         }
 
-        self.worker = threading.Thread(target=self._worker_run, args=(args,), daemon=True)
+        self.worker = threading.Thread(target=self._worker_run_folder, args=(args,), daemon=True)
         self._stop_flag = False
         self.worker.start()
 
@@ -614,14 +707,71 @@ class VerifierGUI(tk.Tk):
         self._stop_flag = True
         self.set_status("Meminta berhenti...")
 
-    def _worker_run(self, args):
-        try:
-            df = pd.read_csv(args["input"])
-        except Exception as e:
-            self.queue.put(("error", f"Gagal baca CSV: {e}")); return
+    # ---- Folder runner: panggil _worker_run untuk setiap file ----
+    def _worker_run_folder(self, args):
+        total_files = len(args["files"])
+        for idx, path in enumerate(args["files"], start=1):
+            if getattr(self, "_stop_flag", False):
+                self.queue.put(("log", f"Proses folder dihentikan di file {idx}/{total_files}"))
+                break
+            self.queue.put(("log", f"\n[=== File {idx}/{total_files}: {os.path.basename(path)} ===]"))
+            sub_args = dict(args)
+            sub_args["input"] = path
+            sub_args["batch_mode"] = (total_files > 1 or os.path.isdir(self.input_path.get()))
+            self._worker_run(sub_args)
 
-        if args["email_col"] not in df.columns:
-            self.queue.put(("error", f"Kolom email '{args['email_col']}' tidak ditemukan. Kolom: {list(df.columns)}")); return
+    def _worker_run(self, args):
+        input_path = args["input"]
+        ext = os.path.splitext(input_path)[1].lower()
+
+        # --- deteksi delimiter dari file CSV ---
+        delim = ","
+        if ext == ".csv":
+            try:
+                with open(input_path, "rb") as fb:
+                    sample = fb.read(4096)
+                for enc in ("utf-8", "cp1252", "latin-1"):
+                    try:
+                        text = sample.decode(enc, errors="strict")
+                        break
+                    except Exception:
+                        text = None
+                if text is None:
+                    text = sample.decode("utf-8", errors="ignore")
+
+                try:
+                    dialect = csv.Sniffer().sniff(text, delimiters=[",",";","\t","|"])
+                    delim = dialect.delimiter
+                except Exception:
+                    delim = ","
+            except Exception:
+                delim = ","
+
+        # --- load DataFrame (CSV/Excel) ---
+        try:
+            if ext == ".xlsx":
+                df = pd.read_excel(input_path, engine="openpyxl")
+            else:
+                df = pd.read_csv(input_path, sep=delim, engine="python")
+            # trim header
+            df.rename(columns=lambda c: c.strip() if isinstance(c, str) else c, inplace=True)
+            self.queue.put(("log", f"[INFO] Loaded {os.path.basename(input_path)} "
+                                   f"({'Excel' if ext=='.xlsx' else f'CSV sep={repr(delim)}'}) "
+                                   f"columns={list(df.columns)}; rows={len(df)}"))
+        except Exception as e:
+            self.queue.put(("error", f"Gagal baca {os.path.basename(input_path)}: {e}")); return
+
+        # ===== Case-insensitive resolve + autodetect fallback =====
+        email_col, company_col = autodetect_columns(df, args["email_col"], args["company_col"])
+        if not email_col:
+            self.queue.put(("error", f"Kolom email tidak ditemukan & gagal autodetect. Kolom tersedia: {list(df.columns)}")); return
+        args["email_col"] = email_col
+        if company_col: args["company_col"] = company_col
+
+        resolved_company_domain = resolve_column_case_insensitive(df, args["company_domain_col"])
+        args["company_domain_col"] = resolved_company_domain if resolved_company_domain else args["company_domain_col"]
+
+        self.queue.put(("log", f"[INFO] Using columns → email: {args['email_col']} | company: {args.get('company_col')} | company_domain: {args.get('company_domain_col')}"))
 
         # Port25 availability (sekali di awal)
         port25_available = True
@@ -643,18 +793,23 @@ class VerifierGUI(tk.Tk):
                 self.queue.put(("log", f"Dihentikan di baris {idx+1}/{total}")); break
 
             raw_email = row[args["email_col"]]
-            email = str(raw_email).strip() if pd.notna(raw_email) else ""
-            company = str(row[args["company_col"]]).strip() if (args["company_col"] in df.columns and pd.notna(row[args["company_col"]])) else None
-            company_domain = str(row[args["company_domain_col"]]).strip() if (args["company_domain_col"] in df.columns and pd.notna(row[args["company_domain_col"]])) else None
+            email_original = str(raw_email).strip() if pd.notna(raw_email) else ""
+            email_for_check = email_original.casefold()
 
-            self.queue.put(("current", email if email else "-"))
+            company_val = None
+            if args["company_col"] in df.columns and pd.notna(row[args["company_col"]]):
+                company_val = str(row[args["company_col"]]).strip()
+            company_domain_val = None
+            if args["company_domain_col"] in df.columns and pd.notna(row[args["company_domain_col"]]):
+                company_domain_val = str(row[args["company_domain_col"]]).strip()
 
-            if not email:
+            self.queue.put(("current", email_original if email_original else "-"))
+
+            if not email_original:
                 self.queue.put(("progress", idx+1)); continue
 
-            res = verify_one(email, company, company_domain, args["smtp_check"], port25_available)
+            res = verify_one(email_for_check, company_val, company_domain_val, args["smtp_check"], port25_available)
 
-            # Ringkas deliverable (tanpa memaksa dari heuristik)
             if res["verif_smtp_deliverable"] is True:
                 deliverable = True
             elif res["verif_smtp_deliverable"] is False:
@@ -674,11 +829,12 @@ class VerifierGUI(tk.Tk):
                    "verif_registered_domain": res["verif_registered_domain"],
                    "verif_reason": res["verif_reason"],
                    "verif_deliverable": deliverable,
-                   "verif_company_pass": company_pass
+                   "verif_company_pass": company_pass,
+                   "_email_original": email_original,
+                   "_company_original": company_val if company_val is not None else ""
                    }
             results.append(out)
 
-            # Kolom SMTP di tabel: OK/NO/N/A → tambah EST jika heuristik
             smtp_cell = "N/A"
             reason = res["verif_reason"]
             if "heuristic:" in reason:
@@ -690,7 +846,7 @@ class VerifierGUI(tk.Tk):
                     smtp_cell = "NO"
 
             self.queue.put(("row", {
-                "email": email,
+                "email": email_original,
                 "syntax": "OK" if res["verif_syntax_ok"] else "NO",
                 "domain": "OK" if res["verif_domain_ok"] else "NO",
                 "mx": "YES" if res["verif_mx_found"] else "NO",
@@ -705,34 +861,47 @@ class VerifierGUI(tk.Tk):
 
         out_df = pd.DataFrame(results)
 
+        # ==== FINAL-ONLY OUTPUT ====
         if len(out_df) > 0:
-            base = os.path.dirname(args["input"]) or "."
-            fmt = (args["output_format"] or "csv").lower().strip()
-            if fmt not in ("csv", "excel"): fmt = "csv"
+            base_directory = os.path.dirname(input_path) or "."
+            output_format = (args["output_format"] or "csv").lower().strip()
+            if output_format not in ("csv", "excel"):
+                output_format = "csv"
 
-            clean_df = out_df[(out_df["verif_deliverable"]) & (out_df["verif_company_pass"])]
+            filtered_final_df = out_df[(out_df["verif_deliverable"]) & (out_df["verif_company_pass"])]
 
-            if fmt == "csv":
-                full_path = os.path.join(base, f"{args['output_prefix']}_full.csv")
-                clean_path = os.path.join(base, f"{args['output_prefix']}_clean.csv")
-                out_df.to_csv(full_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
-                clean_df.to_csv(clean_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+            final_df = pd.DataFrame({
+                "email": filtered_final_df["_email_original"].astype(str),
+                "company": filtered_final_df["_company_original"].astype(str),
+                "deliverable": "YES"
+            })
+
+            # Penamaan file:
+            # - batch_mode True → pakai nama file input (stem)_final
+            # - single file → pakai output_name jika diisi, kalau kosong gunakan prefix_final
+            stem = os.path.splitext(os.path.basename(input_path))[0]
+            batch_mode = bool(args.get("batch_mode"))
+            if batch_mode:
+                filename_safe = f"{stem}_final"
             else:
-                full_path = os.path.join(base, f"{args['output_prefix']}_full.xlsx")
-                clean_path = os.path.join(base, f"{args['output_prefix']}_clean.xlsx")
-                try:
-                    out_df.to_excel(full_path, index=False, engine="openpyxl")
-                    clean_df.to_excel(clean_path, index=False, engine="openpyxl")
-                except Exception as e:
-                    self.queue.put(("log", f"OpenPyXL error: {e}. Fallback ke CSV."))
-                    full_path = os.path.join(base, f"{args['output_prefix']}_full.csv")
-                    clean_path = os.path.join(base, f"{args['output_prefix']}_clean.csv")
-                    out_df.to_csv(full_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
-                    clean_df.to_csv(clean_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+                filename_input = self.output_name.get().strip()
+                filename_safe = filename_input if filename_input else f"{args['output_prefix']}_final"
 
-            self.queue.put(("done", (full_path, clean_path, len(clean_df), len(out_df))))
+            if output_format == "csv":
+                final_path = os.path.join(base_directory, f"{filename_safe}.csv")
+                final_df.to_csv(final_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+            else:
+                final_path = os.path.join(base_directory, f"{filename_safe}.xlsx")
+                try:
+                    final_df.to_excel(final_path, index=False, engine="openpyxl")
+                except Exception as excel_error:
+                    self.queue.put(("log", f"OpenPyXL error: {excel_error}. Fallback ke CSV."))
+                    final_path = os.path.join(base_directory, f"{filename_safe}.csv")
+                    final_df.to_csv(final_path, index=False, quoting=csv.QUOTE_NONNUMERIC)
+
+            self.queue.put(("done_final", (final_path, len(final_df), len(out_df))))
         else:
-            self.queue.put(("done", (None, None, 0, 0)))
+            self.queue.put(("done_final", (None, 0, 0)))
 
     def _poll_queue(self):
         try:
@@ -771,17 +940,20 @@ class VerifierGUI(tk.Tk):
             self.stop_btn.config(state="disabled")
             self.set_status("Error")
             messagebox.showerror("Error", str(payload))
-        elif kind == "done":
-            full_path, clean_path, n_clean, n_all = payload
+        elif kind == "done_final":
+            final_path, kept_rows, total_rows = payload
+            # jangan ubah tombol bila memproses banyak file—tetap enable di akhir tiap file
             self.run_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
             self.set_current("-")
-            if full_path and clean_path:
+            if final_path:
                 self.set_status("Selesai")
-                self.log_write(f"Selesai. Full: {full_path}")
-                self.log_write(f"Selesai. Clean: {clean_path}")
-                self.log_write(f"Clean rows: {n_clean}/{n_all}")
-                messagebox.showinfo("Selesai", f"Berhasil!\nFull: {full_path}\nClean: {clean_path}\nClean rows: {n_clean}/{n_all}")
+                self.log_write(f"Selesai. Final: {final_path}")
+                self.log_write(f"Rows kept (deliverable=YES): {kept_rows}/{total_rows}")
+                messagebox.showinfo(
+                    "Selesai",
+                    f"Berhasil!\nFinal: {final_path}\nRows kept: {kept_rows}/{total_rows}"
+                )
             else:
                 self.set_status("Tidak ada data tersimpan")
                 messagebox.showwarning("Kosong", "Tidak ada baris yang diverifikasi.")
